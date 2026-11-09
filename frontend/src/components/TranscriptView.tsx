@@ -1,5 +1,6 @@
 'use client';
 
+import { withSpeakerPrefix } from '@/lib/speaker';
 import { Transcript } from '@/types';
 import { useEffect, useRef, useState } from 'react';
 import { ConfidenceIndicator } from './ConfidenceIndicator';
@@ -267,11 +268,14 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
         const filteredText = cleanStopWords(textToShow);
         // Show [Silence] ONLY if the ORIGINAL transcript was empty (not just after filtering)
         const originalWasEmpty = transcript.text.trim() === '';
-        const displayText = originalWasEmpty && !isStreaming ? '[Silence]' : filteredText;
+        const displayText = withSpeakerPrefix(originalWasEmpty && !isStreaming ? '[Silence]' : filteredText, transcript.speaker);
 
         // Sizer text: use cleaned version for proper sizing, fallback to [Silence] only if original was empty
-        const sizerText = cleanStopWords(isStreaming ? streamingTranscript.fullText : transcript.text)
-          || (originalWasEmpty && !isStreaming ? '[Silence]' : '');
+        const sizerText = withSpeakerPrefix(
+          cleanStopWords(isStreaming ? streamingTranscript.fullText : transcript.text)
+            || (originalWasEmpty && !isStreaming ? '[Silence]' : ''),
+          transcript.speaker,
+        );
 
         return (
           <motion.div

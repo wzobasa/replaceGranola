@@ -4,7 +4,8 @@
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
-use crate::audio::AudioChunk;
+use crate::audio::speaker_gate::ThemDedup;
+use crate::audio::{AudioChunk, RecordingDeviceType};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +43,9 @@ pub struct TranscriptUpdate {
     pub audio_start_time: f64, // Seconds from recording start (e.g., 125.3)
     pub audio_end_time: f64,   // Seconds from recording start (e.g., 128.6)
     pub duration: f64,          // Segment duration in seconds (e.g., 3.3)
+    /// Who spoke: "mic" (Me) or "system" (Them). Absent on unlabelled legacy payloads.
+    #[serde(default)]
+    pub speaker: Option<String>,
 }
 
 // NOTE: get_transcript_history and get_recording_meeting_name functions
@@ -99,6 +103,9 @@ pub fn start_transcription_task<R: Runtime>(
             let worker_handle = tokio::spawn(async move {
                 info!("👷 Worker {} started", worker_id);
 
+                // Recent Them lines, to drop a Me line that is just echoed Them speech
+                let mut them_dedup = ThemDedup::new();
+
                 // PRE-VALIDATE model state to avoid repeated async calls per chunk
                 let initial_model_loaded = engine_clone.is_model_loaded().await;
                 let current_model = engine_clone
@@ -148,6 +155,10 @@ pub fn start_transcription_task<R: Runtime>(
                             }
 
                             let chunk_timestamp = chunk.timestamp;
+                            let chunk_speaker = match chunk.device_type {
+                                RecordingDeviceType::Microphone => "mic",
+                                RecordingDeviceType::System => "system",
+                            };
                             let chunk_duration = chunk.data.len() as f64 / chunk.sample_rate as f64;
 
                             // Transcribe with provider-agnostic approach
@@ -167,7 +178,20 @@ pub fn start_transcription_task<R: Runtime>(
                                     info!("🔍 Worker {} transcription result: text='{}', confidence={}, partial={}",
                 worker_id, transcript, confidence_str, is_partial);
 
-                                    if should_emit_transcript(&transcript) {
+                                    // Safety net: a Me line that mostly repeats a recent Them line
+                                    // is echo that slipped past the gate - drop it.
+                                    let chunk_end = chunk_timestamp + chunk_duration;
+                                    let is_echo = if chunk_speaker == "system" {
+                                        them_dedup.record_them(chunk_timestamp, chunk_end, &transcript);
+                                        false
+                                    } else {
+                                        them_dedup.is_duplicate_of_them(chunk_timestamp, chunk_end, &transcript)
+                                    };
+                                    if is_echo {
+                                        info!("🔇 Worker {} dropped Me line duplicating Them: '{}'", worker_id, transcript);
+                                    }
+
+                                    if !is_echo && should_emit_transcript(&transcript) {
                                         // PERFORMANCE: Only log transcription results, not every processing step
                                         info!("✅ Worker {} transcribed: {} (confidence: {}, partial: {})",
                                               worker_id, transcript, confidence_str, is_partial);
@@ -215,6 +239,7 @@ pub fn start_transcription_task<R: Runtime>(
                                             audio_start_time,
                                             audio_end_time,
                                             duration: chunk_duration,
+                                            speaker: Some(chunk_speaker.to_string()),
                                         };
 
                                         if let Err(e) = app_clone.emit("transcript-update", &update)

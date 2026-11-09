@@ -1,5 +1,6 @@
 'use client';
 
+import { withSpeakerPrefix } from '@/lib/speaker';
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback, ReactNode, MutableRefObject } from 'react';
 import { Transcript, TranscriptUpdate } from '@/types';
 import { toast } from 'sonner';
@@ -315,6 +316,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: update.audio_start_time,
             audio_end_time: update.audio_end_time,
             duration: update.duration,
+            speaker: update.speaker,
           };
 
           // Add to buffer
@@ -383,6 +385,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
             audio_start_time: segment.audio_start_time,
             audio_end_time: segment.audio_end_time,
             duration: segment.duration,
+            speaker: segment.speaker,
           }));
 
           setTranscripts(formattedTranscripts);
@@ -424,6 +427,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
       audio_start_time: update.audio_start_time,
       audio_end_time: update.audio_end_time,
       duration: update.duration,
+      speaker: update.speaker,
     };
 
     setTranscripts(prev => {
@@ -465,7 +469,7 @@ export function TranscriptProvider({ children }: { children: ReactNode }) {
     };
 
     const fullTranscript = transcripts
-      .map(t => `${formatTime(t.audio_start_time)} ${t.text}`)
+      .map(t => `${formatTime(t.audio_start_time)} ${withSpeakerPrefix(t.text, t.speaker)}`)
       .join('\n');
     navigator.clipboard.writeText(fullTranscript);
 
