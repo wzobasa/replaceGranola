@@ -107,6 +107,15 @@ export default function RootLayout({
     }
   }, []);
   useEffect(() => {
+    const unlisten = listen<{ ok: boolean; message: string }>('obsidian-export', (event) => {
+      if (event.payload.ok) toast.success(event.payload.message);
+      else toast.error(event.payload.message);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+  useEffect(() => {
     // Listen for tray recording toggle request
     const unlisten = listen('request-recording-toggle', () => {
       console.log('[Layout] Received request-recording-toggle from tray');

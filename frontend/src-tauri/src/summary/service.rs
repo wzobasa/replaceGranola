@@ -614,6 +614,14 @@ impl SummaryService {
                             }
                         }
                         info!("Summary saved successfully for meeting_id: {}", meeting_id);
+                        // Best-effort Obsidian export; never affects the summary flow.
+                        crate::summary::obsidian::export_summary(
+                            &_app,
+                            &pool,
+                            &meeting_id,
+                            &strip_title_if_present(&generated.final_markdown),
+                        )
+                        .await;
                     }
                     Ok(false) => warn!("Skipped stale summary completion for meeting_id: {}", meeting_id),
                     Err(error) => error!(
