@@ -24,8 +24,14 @@ use super::speaker_gate::{rms, EchoGate, SYSTEM_SPEECH_MIN_RMS};
 /// as system audio) a 2000ms redemption keeps one VAD segment open
 /// indefinitely, withholds live transcript emission, and overruns the
 /// accumulated-speech-buffer warning threshold. Bounded live segmentation
-/// during continuous speech is tracked separately in #756.
+/// during continuous speech (#756) is handled by `LIVE_MAX_SEGMENT_MS` below,
+/// not by changing the redemption time.
 const VAD_REDEMPTION_TIME_MS: u32 = 500;
+
+/// Live path: force-cut an utterance that runs longer than this so text appears
+/// while someone is still talking (cut at the quietest point of the last ~1s).
+/// Batch import/retranscription keep whole utterances (no cap).
+const LIVE_MAX_SEGMENT_MS: u32 = 6000;
 
 /// Ring buffer for synchronized audio mixing
 /// Accumulates samples from mic and system streams until we have aligned windows
@@ -758,11 +764,13 @@ impl AudioPipeline {
         // first, but under continuous system audio it kept a VAD segment open
         // indefinitely and withheld live transcript emission, so live and batch
         // deliberately diverge. Bounded live segments under continuous speech
-        // are tracked in #756.
-        let mic_vad_processor =
+        // (#756) come from the LIVE_MAX_SEGMENT_MS force-cut in the VAD.
+        let mut mic_vad_processor =
             ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
-        let system_vad_processor =
+        let mut system_vad_processor =
             ContinuousVadProcessor::new(sample_rate, VAD_REDEMPTION_TIME_MS)?;
+        mic_vad_processor.set_max_segment_ms(LIVE_MAX_SEGMENT_MS);
+        system_vad_processor.set_max_segment_ms(LIVE_MAX_SEGMENT_MS);
         info!(
             "VAD-driven pipeline: segments dispatched per speech burst (redemption_time={}ms)",
             VAD_REDEMPTION_TIME_MS
@@ -1132,5 +1140,10 @@ mod tests {
         // uninterrupted speech. Batch import/retranscription use 2000ms.
         // See #679 and #756.
         assert_eq!(VAD_REDEMPTION_TIME_MS, 500);
+    }
+
+    #[test]
+    fn test_live_max_segment_is_bounded_but_not_tiny() {
+        assert!((3000..=10_000).contains(&LIVE_MAX_SEGMENT_MS));
     }
 }

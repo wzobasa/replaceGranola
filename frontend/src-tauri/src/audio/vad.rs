@@ -30,6 +30,66 @@ pub struct ContinuousVadProcessor {
     speech_start_sample: usize,
     // State tracking for smart logging
     last_logged_state: bool,
+    /// Force-cut an in-progress utterance once this many samples are pending (None = never).
+    max_segment_samples: Option<usize>,
+    /// Absolute sample index (VAD timeline) up to which the current utterance was
+    /// already emitted by force-cuts.
+    forced_upto: Option<usize>,
+}
+
+/// Pure force-cut planning. `active` is the Silero active-speech buffer (starting at
+/// absolute sample `speech_start`); `forced_upto` is how far earlier cuts already emitted.
+/// Returns the segment to emit and the new `forced_upto`, or None if under the cap.
+pub(crate) fn plan_force_cut(
+    active: &[f32],
+    speech_start: usize,
+    forced_upto: Option<usize>,
+    max_samples: usize,
+) -> Option<(SpeechSegment, usize)> {
+    let rel_done = forced_upto.map(|u| u.saturating_sub(speech_start)).unwrap_or(0);
+    if active.len() < rel_done + max_samples {
+        return None;
+    }
+    let pending = &active[rel_done..];
+    let cut = find_cut_point(pending);
+    if cut == 0 {
+        return None;
+    }
+    let start_abs = speech_start + rel_done;
+    let end_abs = start_abs + cut;
+    let to_ms = |x: usize| x as f64 * 1000.0 / VAD_SAMPLE_RATE as f64;
+    Some((
+        SpeechSegment {
+            samples: pending[..cut].to_vec(),
+            start_timestamp_ms: to_ms(start_abs),
+            end_timestamp_ms: to_ms(end_abs),
+            confidence: 0.85,
+        },
+        end_abs,
+    ))
+}
+
+/// Window (samples at 16kHz) before a force-cut where the quietest frame is searched.
+const CUT_SEARCH_WINDOW: usize = VAD_SAMPLE_RATE as usize; // 1s
+
+/// Index (into `pending`) at which to split: centre of the lowest-energy 30ms frame
+/// within the last ~1s, so a forced cut is unlikely to land mid-word.
+pub(crate) fn find_cut_point(pending: &[f32]) -> usize {
+    const FRAME: usize = 480;
+    if pending.len() <= FRAME {
+        return pending.len();
+    }
+    let search_start = pending.len().saturating_sub(CUT_SEARCH_WINDOW);
+    let mut best = (f32::MAX, pending.len());
+    let mut pos = search_start;
+    while pos + FRAME <= pending.len() {
+        let e = pending[pos..pos + FRAME].iter().map(|x| x * x).sum::<f32>();
+        if e < best.0 {
+            best = (e, pos + FRAME / 2);
+        }
+        pos += FRAME / 2;
+    }
+    best.1
 }
 
 impl ContinuousVadProcessor {
@@ -84,7 +144,15 @@ impl ContinuousVadProcessor {
             speech_start_sample: 0,
             // Initialize state tracking
             last_logged_state: false,
+            max_segment_samples: None,
+            forced_upto: None,
         })
+    }
+
+    /// Bound utterance length: continuous speech is emitted in chunks of about this
+    /// many ms instead of waiting for a pause (live path only; batch keeps whole utterances).
+    pub fn set_max_segment_ms(&mut self, ms: u32) {
+        self.max_segment_samples = Some(ms as usize * VAD_SAMPLE_RATE as usize / 1000);
     }
 
     /// Start (ms, VAD timeline) of speech currently in progress, if any.
@@ -218,9 +286,15 @@ impl ContinuousVadProcessor {
                     real_sample_count
                 ));
             }
-            let samples = active_speech[..real_sample_count].to_vec();
+            let rel_done = self
+                .forced_upto
+                .take()
+                .map(|u| u.saturating_sub(self.speech_start_sample))
+                .unwrap_or(0)
+                .min(real_sample_count);
+            let samples = active_speech[rel_done..real_sample_count].to_vec();
             let start_ms =
-                (self.speech_start_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
+                ((self.speech_start_sample + rel_done) as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
             let end_ms = (real_end_sample as f64 / VAD_SAMPLE_RATE as f64) * 1000.0;
 
             debug!("VAD flush: Force-ending speech - start={}ms, end={}ms, duration={}ms, samples={}",
@@ -283,6 +357,7 @@ impl ContinuousVadProcessor {
                     // surfaced once per recording, on the final segment — which landed at
                     // ~2x the file duration and sorted to the end of the transcript.
                     self.speech_start_sample = timestamp_ms * VAD_SAMPLE_RATE as usize / 1000;
+                    self.forced_upto = None;
                     self.current_speech.clear();
                 }
                 VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {
@@ -298,6 +373,20 @@ impl ContinuousVadProcessor {
                         samples
                     } else {
                         self.current_speech.clone()
+                    };
+
+                    // Drop the part already emitted by force-cuts.
+                    let (speech_samples, start_timestamp_ms) = match self.forced_upto.take() {
+                        Some(upto) => {
+                            let skip = upto
+                                .saturating_sub(self.speech_start_sample)
+                                .min(speech_samples.len());
+                            (
+                                speech_samples[skip..].to_vec(),
+                                upto * 1000 / VAD_SAMPLE_RATE as usize,
+                            )
+                        }
+                        None => (speech_samples, start_timestamp_ms),
                     };
 
                     if !speech_samples.is_empty() {
@@ -325,7 +414,30 @@ impl ContinuousVadProcessor {
         }
 
         self.processed_samples += chunk.len();
+        self.maybe_force_cut();
         Ok(())
+    }
+
+    /// If the in-progress utterance exceeds the cap, emit its pending part now.
+    fn maybe_force_cut(&mut self) {
+        let Some(max) = self.max_segment_samples else { return };
+        if !self.in_speech {
+            return;
+        }
+        let planned = plan_force_cut(
+            self.session.get_current_speech(),
+            self.speech_start_sample,
+            self.forced_upto,
+            max,
+        );
+        let Some((segment, end_abs)) = planned else { return };
+        info!(
+            "VAD: force-cut long speech: {:.1}s ({} samples)",
+            segment.samples.len() as f64 / VAD_SAMPLE_RATE as f64,
+            segment.samples.len()
+        );
+        self.speech_segments.push_back(segment);
+        self.forced_upto = Some(end_abs);
     }
 }
 
@@ -784,5 +896,42 @@ mod tests {
             processor.flush().expect("second flush failed").is_empty(),
             "flush() must not emit the same forced segment twice"
         );
+    }
+
+    #[test]
+    fn find_cut_point_prefers_quietest_frame_in_last_second() {
+        let mut v = vec![0.5f32; 16000 * 6];
+        let quiet = 16000 * 6 - 6000;
+        for x in &mut v[quiet..quiet + 960] {
+            *x = 0.0;
+        }
+        let cut = find_cut_point(&v);
+        assert!((quiet..quiet + 960).contains(&cut), "cut {cut} not in quiet region");
+        // A quiet spot older than 1s is ignored.
+        let mut w = vec![0.5f32; 16000 * 6];
+        for x in &mut w[1000..2000] {
+            *x = 0.0;
+        }
+        assert!(find_cut_point(&w) > 16000 * 5);
+    }
+
+    #[test]
+    fn plan_force_cut_chunks_are_bounded_and_contiguous() {
+        let max = 16000 * 6;
+        let start = 20_000usize; // absolute start of the utterance
+        let active = vec![0.3f32; 16000 * 20];
+        assert!(plan_force_cut(&active[..max - 1], start, None, max).is_none());
+
+        let (seg1, up1) = plan_force_cut(&active[..max + 100], start, None, max).expect("first cut");
+        assert!(seg1.samples.len() <= max + 100);
+        assert_eq!(seg1.start_timestamp_ms, start as f64 * 1000.0 / 16000.0);
+        assert_eq!(up1, start + seg1.samples.len());
+
+        // Second cut resumes exactly where the first stopped; not due until another `max`.
+        let rel1 = up1 - start;
+        assert!(plan_force_cut(&active[..rel1 + max - 1], start, Some(up1), max).is_none());
+        let (seg2, up2) = plan_force_cut(&active[..rel1 + max + 50], start, Some(up1), max).expect("second cut");
+        assert_eq!(seg2.start_timestamp_ms, seg1.end_timestamp_ms);
+        assert!(up2 > up1);
     }
 }
